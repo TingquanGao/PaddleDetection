@@ -39,9 +39,9 @@ class RoIAlign(nn.Layer):
             default 0.0625
         sampling_ratio (int): The number of sampling points in the interpolation
             grid, default 0
-        canconical_level (int): The referring level of FPN layer with 
+        canconical_level (int): The referring level of FPN layer with
             specified level. default 4
-        canonical_size (int): The referring scale of FPN layer with 
+        canonical_size (int): The referring scale of FPN layer with
             specified scale. default 224
         start_level (int): The start level of FPN layer to extract RoI feature,
             default 0
@@ -68,10 +68,7 @@ class RoIAlign(nn.Layer):
         self.canonical_size = canonical_size
         self.start_level = start_level
         self.end_level = end_level
-        if 'npu' in paddle.device.get_device():
-            self.aligned = False
-        else:
-            self.aligned = aligned
+        self.aligned = False # TODO: npu kernel do not support aligned=True
 
     @classmethod
     def from_config(cls, cfg, input_shape):
