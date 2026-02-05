@@ -180,6 +180,7 @@ class COCODataSet(DetDataset):
                 gt_bbox = np.zeros((num_bbox, 4), dtype=np.float32)
                 gt_class = np.zeros((num_bbox, 1), dtype=np.int32)
                 is_crowd = np.zeros((num_bbox, 1), dtype=np.int32)
+                gt_read_order = np.zeros((num_bbox), dtype=np.int32)
                 gt_poly = [None] * num_bbox
                 gt_track_id = -np.ones((num_bbox, 1), dtype=np.int32)
 
@@ -190,6 +191,7 @@ class COCODataSet(DetDataset):
                     gt_class[i][0] = self.catid2clsid[catid]
                     gt_bbox[i, :] = box['clean_bbox']
                     is_crowd[i][0] = box['iscrowd']
+                    gt_read_order[i] = box['read_order']
                     # check RLE format 
                     if 'segmentation' in box and box['iscrowd'] == 1:
                         gt_poly[i] = [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]
@@ -219,6 +221,7 @@ class COCODataSet(DetDataset):
                     'gt_class': gt_class,
                     'gt_bbox': gt_bbox,
                     'gt_poly': gt_poly,
+                    'gt_read_order': gt_read_order,
                 }
                 if has_track_id:
                     gt_rec.update({'gt_track_id': gt_track_id})

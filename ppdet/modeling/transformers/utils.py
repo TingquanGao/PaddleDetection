@@ -523,3 +523,177 @@ def mal_loss_with_logits(pred_logits,
                                               weight=weight,
                                               reduction='none')
     return loss.mean(1).sum() / normalizer
+
+
+import paddle
+import paddle.nn as nn
+import paddle.nn.functional as F
+
+INF = 1e4
+
+class RotaryPositionEmbeddingPD(nn.Layer):
+    def __init__(self, dim, max_seq_len=16384):
+        super().__init__()
+        self.dim = dim
+        inv_freq = 1.0 / (10000 ** (paddle.arange(0, dim, 2, dtype='float32') / dim))
+        t = paddle.arange(max_seq_len, dtype='float32')
+        freqs = paddle.einsum('n,d->nd', t, inv_freq)              # [L, dim/2]
+        self.register_buffer('sin', paddle.sin(freqs), persistable=False)
+        self.register_buffer('cos', paddle.cos(freqs), persistable=False)
+
+    def forward(self, x, seqlen, seq_axis=-2):
+        """
+        x: 任意形状，最后一维为 Dh（偶数）。把 RoPE 作用在 (seq_axis, last_dim) 两维上。
+        """
+        nd = x.ndim
+        # 把序列维换到 -2
+        if seq_axis < 0:
+            seq_axis = nd + seq_axis
+        if seq_axis != nd - 2:
+            perm = list(range(nd))
+            perm[seq_axis], perm[-2] = perm[-2], perm[seq_axis]
+            x = x.transpose(perm)
+
+        Dh = x.shape[-1]
+        x1, x2 = x[..., 0::2], x[..., 1::2]                       # [..., L, Dh/2]
+        sin = self.sin[:seqlen].reshape([1] * (nd - 2) + [seqlen, Dh // 2])
+        cos = self.cos[:seqlen].reshape([1] * (nd - 2) + [seqlen, Dh // 2])
+
+        y1 = x1 * cos - x2 * sin
+        y2 = x1 * sin + x2 * cos
+        y  = paddle.stack([y1, y2], axis=-1).reshape(x.shape)
+
+        # 换回原始轴顺序
+        if seq_axis != nd - 2:
+            inv = list(range(nd))
+            inv[seq_axis], inv[-2] = inv[-2], inv[seq_axis]
+            y = y.transpose(inv)
+        return y
+
+
+# class GlobalPointerPD(nn.Layer):
+#     """
+#     heads: 关系类型数（阅读顺序用 1）
+#     head_size: 每头维度（如 64）
+#     输出: logits [B,H,N,N]（只保留上三角），mask [B,1,N,N]（True=无效）
+#     """
+#     def __init__(self, hidden_size, heads=1, head_size=64, use_rope=True, tril_mask=False, max_length=1024):
+#         super().__init__()
+#         self.heads = heads
+#         self.head_size = head_size
+#         self.use_rope = use_rope
+#         self.tril_mask = tril_mask
+#         self.dense = nn.Linear(hidden_size, heads * 2 * head_size)
+#         self.rotary = RotaryPositionEmbeddingPD(head_size, max_length) if use_rope else None
+#         self.dropout = nn.Dropout(0.1) 
+
+#     def forward(self, inputs, attn_mask_1d=None):
+#         """
+#         inputs: [B, N, hidden]
+#         attn_mask_1d: [B, N]，有效=1/True;padding=0/False
+#         """
+#         B, N, _ = inputs.shape
+#         proj = self.dense(inputs).reshape([B, N, self.heads, 2, self.head_size])
+#         proj = self.dropout(proj)
+#         qw, kw = proj[..., 0, :], proj[..., 1, :]           # [B, N, H, Dh]
+
+#         if self.use_rope:
+#             # 让 RoPE 作用在最后一维，自动广播头维
+#             qw = self.rotary(qw, N, seq_axis=1)
+#             kw = self.rotary(kw, N, seq_axis=1)
+
+
+#         # 相似度 -> [B, H, N, N]
+#         qw_t = qw.transpose([0, 2, 1, 3])                   # [B,H,N,Dh]
+#         kw_t = kw.transpose([0, 2, 1, 3])
+#         logits = paddle.einsum('bhmd,bhnd->bhmn', qw_t, kw_t) / (self.head_size ** 0.5)
+
+#         # pair mask（padding）
+#         if attn_mask_1d is None:
+#             attn_mask_1d = paddle.ones([B, N], dtype='float32')
+#         a = attn_mask_1d.astype('float32')                  # [B,N]
+#         pair_mask = 1.0 - (a.unsqueeze(1).unsqueeze(2) * a.unsqueeze(1).unsqueeze(3))  # [B,1,N,N]
+#         logits = logits - pair_mask * INF
+
+#         # 仅保留上三角（i<j），屏蔽对角与下三角
+#         if self.tril_mask:
+#             lower = paddle.tril(paddle.ones([N, N], dtype='float32'))  # 含对角
+#             lower = lower.astype('bool').unsqueeze(0).unsqueeze(0)     # [1,1,N,N]😉
+#             logits = logits - lower.astype(logits.dtype) * INF
+#             pair_mask = paddle.logical_or(pair_mask.astype('bool'), lower)
+
+#         return logits, pair_mask.astype('bool')
+
+# class GlobalPointerPD(nn.Layer):
+#     """
+#     heads: 关系类型数（如阅读顺序用 1）
+#     head_size: 每头维度（如 64）
+#     输出: logits [B,H,N,N]（可选仅保留上三角）
+#     """
+#     def __init__(self, hidden_size, heads=1, head_size=64, use_rope=True, tril_mask=False, max_length=1024):
+#         super().__init__()
+#         self.heads = heads
+#         self.head_size = head_size
+#         self.use_rope = use_rope
+#         self.tril_mask = tril_mask
+#         self.dense = nn.Linear(hidden_size, heads * 2 * head_size)
+#         self.rotary = RotaryPositionEmbeddingPD(head_size, max_length) if use_rope else None
+#         self.dropout = nn.Dropout(0.1)
+
+#     def forward(self, inputs):
+#         """
+#         inputs: [B, N, hidden]
+#         """
+#         B, N, _ = inputs.shape
+#         proj = self.dense(inputs).reshape([B, N, self.heads, 2, self.head_size])
+#         proj = self.dropout(proj)
+#         qw, kw = proj[..., 0, :], proj[..., 1, :]           # [B, N, H, Dh]
+
+#         if self.use_rope:
+#             qw = self.rotary(qw, N, seq_axis=1)
+#             kw = self.rotary(kw, N, seq_axis=1)
+
+#         # 相似度 -> [B, H, N, N]
+#         qw_t = qw.transpose([0, 2, 1, 3])  # [B, H, N, Dh]
+#         kw_t = kw.transpose([0, 2, 1, 3])
+#         logits = paddle.einsum('bhmd,bhnd->bhmn', qw_t, kw_t) / (self.head_size ** 0.5)
+
+#         # 仅保留上三角（i<j），屏蔽对角与下三角
+#         if self.tril_mask:
+#             lower = paddle.tril(paddle.ones([N, N], dtype=logits.dtype))  # 含对角
+#             logits = logits - lower.unsqueeze(0).unsqueeze(0) * INF
+
+#         return logits   # [B, H, N, N]
+
+
+class GlobalPointerPD(nn.Layer):
+    """
+    head_size: 每头维度（如 64）
+    输出: logits [B, N, N]（可选仅保留上三角）
+    """
+    def __init__(self, hidden_size, head_size=64):
+        super().__init__()
+        self.head_size = head_size
+        self.dense = nn.Linear(hidden_size, 2 * head_size)
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, inputs):
+        """
+        inputs: [B, N, hidden]
+        返回: logits [B, N, N]
+        """
+        B, N, _ = inputs.shape
+        proj = self.dense(inputs).reshape([B, N, 2, self.head_size])
+        proj = self.dropout(proj)
+        qw, kw = proj[:, :, 0, :], proj[:, :, 1, :]           # [B, N, Dh]
+
+        # 相似度 -> [B, N, N]
+        # logits = paddle.einsum('bmd,bnd->bmn', qw, kw) / (self.head_size ** 0.5)  # [B, N, N]
+
+        # 新代码建议:
+        raw_logits = paddle.einsum('bmd,bnd->bmn', qw, kw) / (self.head_size ** 0.5)
+        # 强制反对称: Logits_final = Logits - Logits.T
+        # 这样 Logits[i,j] = -Logits[j,i]，且对角线必为 0
+        logits = raw_logits - raw_logits.transpose([0, 2, 1])
+
+        return logits   # [B, N, N]

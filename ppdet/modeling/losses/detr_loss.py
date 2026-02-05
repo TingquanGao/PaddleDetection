@@ -24,7 +24,7 @@ from .iou_loss import GIoULoss
 from ..transformers import bbox_cxcywh_to_xyxy, sigmoid_focal_loss, varifocal_loss_with_logits, mal_loss_with_logits
 from ..bbox_utils import bbox_iou
 
-__all__ = ['DETRLoss', 'DINOLoss', 'RTDETRv3Loss']
+__all__ = ['DETRLoss', 'DINOLoss', 'RTDETRv3Loss', 'MaskDINOLoss', 'PPDocLayoutV3Loss']
 
 
 @register
@@ -77,6 +77,7 @@ class DETRLoss(nn.Layer):
                                                    loss_coeff['class'])
             self.loss_coeff['class'][-1] = loss_coeff['no_object']
         self.giou_loss = GIoULoss()
+        self.read_order_loss = RelativeReadingOrderLoss()
 
     def _get_loss_class(self,
                         logits,
@@ -117,7 +118,7 @@ class DETRLoss(nn.Layer):
                         [bs, num_query_objects, 1]) * target_label
                     target_score = paddle.multiply(target_score,
                                                    target_score_iou)
-                    if self.use_mal:                    
+                    if self.use_mal:
                         loss_ = self.loss_coeff[
                             'class'] * mal_loss_with_logits(
                                 logits, target_score, target_label,
@@ -334,6 +335,8 @@ class DETRLoss(nn.Layer):
                              logits,
                              gt_bbox,
                              gt_class,
+                             order_logits=None,
+                             gt_read_order=None,
                              masks=None,
                              gt_mask=None,
                              postfix="",
@@ -358,8 +361,8 @@ class DETRLoss(nn.Layer):
                         bbox_cxcywh_to_xyxy(src_bbox).split(4, -1),
                         bbox_cxcywh_to_xyxy(target_bbox).split(4, -1))
                 elif self.vfl_iou_type == 'mask':
-                    assert (masks is not None and gt_mask is not None,
-                            'Make sure the input has `mask` and `gt_mask`')
+                    assert masks is not None and gt_mask is not None, \
+                        'Make sure the input has `mask` and `gt_mask`'
                     assert sum(len(a) for a in gt_mask) > 0
                     src_mask, target_mask = self._get_src_target_assign(
                         masks.detach(), gt_mask, match_indices)
@@ -405,6 +408,9 @@ class DETRLoss(nn.Layer):
         loss.update(
             self._get_loss_bbox(boxes, gt_bbox, match_indices, num_gts,
                                 postfix))
+        if order_logits is not None and gt_read_order is not None:
+            loss["order_loss"] = self.read_order_loss(order_logits, gt_read_order, match_indices) * self.loss_coeff['order']
+
         if masks is not None and gt_mask is not None:
             loss.update(
                 self._get_loss_mask(masks, gt_mask, match_indices, num_gts,
@@ -416,6 +422,8 @@ class DETRLoss(nn.Layer):
                 logits,
                 gt_bbox,
                 gt_class,
+                order_logits=None,
+                gt_read_order=None,
                 masks=None,
                 gt_mask=None,
                 postfix="",
@@ -442,6 +450,8 @@ class DETRLoss(nn.Layer):
             logits[-1],
             gt_bbox,
             gt_class,
+            order_logits[-1] if order_logits is not None else None,
+            gt_read_order,
             masks=masks[-1] if masks is not None else None,
             gt_mask=gt_mask,
             postfix=postfix,
@@ -467,8 +477,145 @@ class DETRLoss(nn.Layer):
         return total_loss
 
 
+class RelativeReadingOrderLoss(nn.Layer):
+    """
+    Loss function for relative reading order prediction.
+    Predicts pairwise reading order relationships between matched instances.
+    """
+
+    def __init__(self,
+                 use_upper_only=True,
+                 k_local=5,
+                 locality=True,
+                 k_local_ratio=0.3,
+                 w_gt=2.0,
+                 label_smooth=0.01,
+                 robust='gce',
+                 q=0.7):
+        """
+        Args:
+            use_upper_only (bool): Whether to supervise only upper triangular pairs.
+            k_local (int): Number of neighboring pairs to emphasize.
+            locality (bool): Whether to apply locality-based weighting.
+            k_local_ratio (float): Ratio to determine local neighborhood size.
+            w_gt (float): Weight multiplier for local pairs.
+            label_smooth (float): Label smoothing epsilon.
+            robust (str): Loss type, 'gce' for generalized cross entropy or 'bce'.
+            q (float): Q parameter for GCE loss.
+        """
+        super().__init__()
+        self.use_upper_only = use_upper_only
+        self.k_local = k_local
+        self.locality = locality
+        self.k_local_ratio = k_local_ratio
+        self.w_gt = w_gt
+        self.label_smooth = label_smooth
+        self.robust = robust
+        self.q = q
+
+    @staticmethod
+    def _pair_mask(N: int, use_upper_only: bool = False):
+        """Generate supervision mask for pairs."""
+        if use_upper_only:
+            # Upper triangular (excluding diagonal)
+            return paddle.triu(paddle.ones([N, N], dtype='bool'), 1)
+        else:
+            # Full matrix (excluding diagonal)
+            eye = paddle.eye(N)
+            return ~eye.astype('bool')
+
+    @staticmethod
+    def _valid_pair_mask(order):
+        v = (order >= 0).astype('bool')
+        return v.unsqueeze(0) & v.unsqueeze(1)
+
+    def _gce_loss(self, logits, target, q):
+        p = F.sigmoid(logits)
+        p_y = p * target + (1 - p) * (1 - target)
+        return (1.0 - paddle.pow(paddle.clip(p_y, 1e-6, 1.0), q)) / q
+
+    def forward(self, relative_logits, gt_read_order, match_indices, gt_bboxes=None):
+        """
+        Forward pass for relative reading order loss computation.
+
+        Args:
+            relative_logits: [B, Q, Q] - Pairwise order logits between all queries.
+            gt_read_order: List[Tensor[N_gt]] - Ground truth reading order for each image.
+            match_indices: List[Tuple[Tensor[M], Tensor[M]]] - Matched (pred_idx, gt_idx) for each image.
+            gt_bboxes: List[Tensor[N_gt, 4]] - Ground truth bounding boxes (optional).
+
+        Returns:
+            Tensor: Averaged reading order loss.
+        """
+        total_loss_num = paddle.to_tensor(0.0, dtype='float32')
+        total_pairs = paddle.to_tensor(0.0, dtype='float32')
+
+        B = len(gt_read_order)
+        for i in range(B):
+            pred_idx, gt_idx = match_indices[i]
+            if pred_idx.numel() == 0 or gt_idx.numel() == 0:
+                continue
+            N = pred_idx.shape[0]
+            if N <= 1:
+                continue
+
+            # Extract order logits between matched predictions
+            logits = relative_logits[i][pred_idx][:, pred_idx]
+            # Extract ground truth reading order for matched instances
+            order = gt_read_order[i][gt_idx]
+
+            valid_pair = self._valid_pair_mask(order)
+            pair_mask = self._pair_mask(N, self.use_upper_only)
+            base_mask = valid_pair & pair_mask
+
+            pair_sum = paddle.sum(base_mask.astype('float32'))
+            if float(pair_sum) == 0.0:
+                continue
+
+            # Build target matrix
+            # target[i,j] = 1 means i comes before j (order[i] < order[j])
+            o1, o2 = order.unsqueeze(1), order.unsqueeze(0)
+            target_full = (o1 < o2).astype('float32')
+
+            # Compute locality-based weights
+            order_dist = paddle.abs(o1 - o2)
+            k_local_i = min(max(self.k_local, int(N * self.k_local_ratio)), N - 1)
+
+            W = paddle.ones([N, N], dtype='float32')
+            if self.locality:
+                # Local pairs: order distance in range (0, k_local_i]
+                gt_local = (order_dist > 0) & (order_dist <= k_local_i)
+                W = W + (self.w_gt - 1.0) * gt_local.astype('float32')
+
+            # Extract supervised pairs
+            z = logits[base_mask]
+            t = target_full[base_mask]
+            Wm = W[base_mask]
+
+            # Normalize weights (keep relative weights, but mean = 1)
+            Wm = Wm / (paddle.mean(Wm) + 1e-6)
+
+            # Label smoothing
+            if self.label_smooth > 0:
+                eps = self.label_smooth
+                t = t * (1 - eps) + 0.5 * eps
+
+            # Per-pair loss
+            if self.robust == 'gce':
+                per_pair_loss = self._gce_loss(z, t, self.q)
+            else:
+                per_pair_loss = F.binary_cross_entropy_with_logits(z, t, reduction='none')
+
+            loss_main = (per_pair_loss * Wm).mean()
+            total_loss_num = total_loss_num + loss_main * pair_sum
+            total_pairs = total_pairs + pair_sum
+
+        return total_loss_num / (total_pairs + 1e-12)
+
+
 @register
 class DINOLoss(DETRLoss):
+
     def forward(self,
                 boxes,
                 logits,
@@ -779,3 +926,129 @@ class MaskDINOLoss(DETRLoss):
                 ],
                 axis=1)
         return sample_points
+
+@register
+class PPDocLayoutV3Loss(MaskDINOLoss):
+    """
+    Loss function for PP-DocLayoutV3 model with reading order support.
+    Extends MaskDINOLoss to include relative reading order loss.
+    """
+    __shared__ = ['num_classes', 'use_focal_loss', 'num_sample_points']
+    __inject__ = ['matcher']
+
+    def __init__(self,
+                 num_classes=80,
+                 matcher='HungarianMatcher',
+                 loss_coeff={
+                     'class': 4,
+                     'bbox': 5,
+                     'giou': 2,
+                     'mask': 5,
+                     'dice': 5,
+                     'order': 50
+                 },
+                 aux_loss=True,
+                 use_focal_loss=False,
+                 use_vfl=False,
+                 vfl_iou_type='bbox',
+                 num_sample_points=12544,
+                 oversample_ratio=3.0,
+                 important_sample_ratio=0.75,
+                 use_upper_only=True,
+                 k_local=5,
+                 locality=True,
+                 k_local_ratio=0.3,
+                 w_gt=2.0,
+                 label_smooth=0.01,
+                 robust='gce',
+                 q=0.7):
+        """
+        Args:
+            loss_coeff (dict): Loss coefficients including 'order' for reading order loss.
+            use_upper_only (bool): Whether to supervise only upper triangular pairs for order.
+            k_local (int): Number of neighboring pairs to emphasize.
+            locality (bool): Whether to apply locality-based weighting.
+            k_local_ratio (float): Ratio to determine local neighborhood size.
+            w_gt (float): Weight multiplier for local pairs.
+            label_smooth (float): Label smoothing epsilon for order loss.
+            robust (str): Loss type for order, 'gce' or 'bce'.
+            q (float): Q parameter for GCE loss.
+        """
+        super(PPDocLayoutV3Loss, self).__init__(
+            num_classes, matcher, loss_coeff, aux_loss, use_focal_loss,
+            use_vfl, vfl_iou_type, num_sample_points, oversample_ratio,
+            important_sample_ratio)
+        
+        self.order_loss_fn = RelativeReadingOrderLoss(
+            use_upper_only=use_upper_only,
+            k_local=k_local,
+            locality=locality,
+            k_local_ratio=k_local_ratio,
+            w_gt=w_gt,
+            label_smooth=label_smooth,
+            robust=robust,
+            q=q)
+
+    def forward(self,
+                boxes,
+                logits,
+                order_logits,
+                gt_bbox,
+                gt_class,
+                gt_read_order,
+                masks=None,
+                gt_mask=None,
+                postfix="",
+                dn_out_bboxes=None,
+                dn_out_logits=None,
+                dn_out_masks=None,
+                dn_meta=None,
+                **kwargs):
+        """
+        Forward pass with reading order loss computation.
+        
+        Args:
+            order_logits: [num_layers, B, Q, Q] - Reading order logits.
+            gt_read_order: List[Tensor[N_gt]] - Ground truth reading order.
+        """
+        num_gts = self._get_num_gts(gt_class)
+        total_loss = super(PPDocLayoutV3Loss, self).forward(
+            boxes,
+            logits,
+            gt_bbox,
+            gt_class,
+            masks=masks,
+            gt_mask=gt_mask,
+            postfix=postfix,
+            dn_out_bboxes=dn_out_bboxes,
+            dn_out_logits=dn_out_logits,
+            dn_out_masks=dn_out_masks,
+            dn_meta=dn_meta,
+            **kwargs)
+
+        # Compute reading order loss for each decoder layer
+        if order_logits is not None and gt_read_order is not None:
+            num_layers = order_logits.shape[0]
+
+            # Get match indices from bbox/class/mask matching
+            match_indices = self.matcher(
+                boxes[-1].detach(),
+                logits[-1].detach(),
+                gt_bbox,
+                gt_class,
+                masks=masks[-1].detach() if masks is not None else None,
+                gt_mask=gt_mask)
+
+            loss_order = 0.0
+            for layer_idx in range(num_layers):
+                layer_order_loss = self.order_loss_fn(
+                    order_logits[layer_idx],
+                    gt_read_order,
+                    match_indices,
+                    gt_bbox)
+                loss_order = loss_order + layer_order_loss
+
+            loss_order = loss_order / num_layers
+            total_loss['loss_order'] = loss_order * self.loss_coeff['order']
+
+        return total_loss

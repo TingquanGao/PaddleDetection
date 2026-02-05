@@ -24,7 +24,7 @@ import pycocotools.mask as mask_util
 from ..initializer import linear_init_, constant_
 from ..transformers.utils import inverse_sigmoid
 
-__all__ = ['DETRHead', 'DeformableDETRHead', 'DINOHead', 'MaskDINOHead', 'RTDETRv3Head']
+__all__ = ['DETRHead', 'DeformableDETRHead', 'DINOHead', 'MaskDINOHead', 'RTDETRv3Head', 'PPDocLayoutV3Head']
 
 
 def get_activation(name="LeakyReLU"):
@@ -535,9 +535,6 @@ class MaskDINOHead(nn.Layer):
             out_masks = paddle.concat(
                 [enc_out_masks.unsqueeze(0), dec_out_masks])
 
-            inputs['gt_segm'] = [gt_segm.astype(out_masks.dtype)
-                                 for gt_segm in inputs['gt_segm']]
-
             return self.loss(
                 out_bboxes,
                 out_logits,
@@ -599,7 +596,7 @@ class RTDETRv3Head(nn.Layer):
                         loss.update({
                             key: loss.get(key, paddle.zeros([1])) + value
                         })
-                
+
                 split_dec_num = [sum(dn['dn_num_split']) for dn in dn_meta]
                 split_enc_num = [dn['dn_num_split'][1] for dn in dn_meta]
                 dec_out_bboxes = paddle.split(dec_out_bboxes, split_dec_num, axis=2)
@@ -616,7 +613,7 @@ class RTDETRv3Head(nn.Layer):
                         enc_topk_bboxes[g_id].unsqueeze(0), dec_out_bboxes_gid])
                     out_logits_gid = paddle.concat([
                         enc_topk_logits[g_id].unsqueeze(0), dec_out_logits_gid])
-                    
+
                     loss_gid = self.loss(
                         out_bboxes_gid,
                         out_logits_gid,
@@ -656,3 +653,96 @@ class RTDETRv3Head(nn.Layer):
         else:
             return (dec_out_bboxes[self.eval_idx],
                     dec_out_logits[self.eval_idx], None)
+
+@register
+class PPDocLayoutV3Head(nn.Layer):
+    """
+    Head for PP-DocLayoutV3 model with reading order prediction support.
+    Extends MaskDINOHead functionality with order logits output.
+    """
+    __inject__ = ['loss']
+
+    def __init__(self, loss='PPDocLayoutV3Loss'):
+        super(PPDocLayoutV3Head, self).__init__()
+        self.loss = loss
+
+    def forward(self, out_transformer, body_feats, inputs=None):
+        """
+        Forward pass for PP-DocLayoutV3Head.
+
+        Args:
+            out_transformer: Tuple containing (dec_out_logits, dec_out_bboxes, dec_out_masks,
+                            dec_out_order_logits, enc_out, init_out, dn_meta)
+        """
+        (dec_out_logits, dec_out_bboxes, dec_out_masks, dec_out_order_logits,
+         enc_out, init_out, dn_meta) = out_transformer
+        
+        if self.training:
+            assert inputs is not None
+            assert 'gt_bbox' in inputs and 'gt_class' in inputs
+            assert 'gt_segm' in inputs
+            assert 'gt_read_order' in inputs
+
+            if dn_meta is not None:
+                dn_out_logits, dec_out_logits = paddle.split(
+                    dec_out_logits, dn_meta['dn_num_split'], axis=2)
+                dn_out_bboxes, dec_out_bboxes = paddle.split(
+                    dec_out_bboxes, dn_meta['dn_num_split'], axis=2)
+                dn_out_masks, dec_out_masks = paddle.split(
+                    dec_out_masks, dn_meta['dn_num_split'], axis=2)
+                if init_out is not None:
+                    init_out_logits, init_out_bboxes, init_out_masks = init_out
+                    init_out_logits_dn, init_out_logits = paddle.split(
+                        init_out_logits, dn_meta['dn_num_split'], axis=1)
+                    init_out_bboxes_dn, init_out_bboxes = paddle.split(
+                        init_out_bboxes, dn_meta['dn_num_split'], axis=1)
+                    init_out_masks_dn, init_out_masks = paddle.split(
+                        init_out_masks, dn_meta['dn_num_split'], axis=1)
+
+                    dec_out_logits = paddle.concat(
+                        [init_out_logits.unsqueeze(0), dec_out_logits])
+                    dec_out_bboxes = paddle.concat(
+                        [init_out_bboxes.unsqueeze(0), dec_out_bboxes])
+                    dec_out_masks = paddle.concat(
+                        [init_out_masks.unsqueeze(0), dec_out_masks])
+
+                    dn_out_logits = paddle.concat(
+                        [init_out_logits_dn.unsqueeze(0), dn_out_logits])
+                    dn_out_bboxes = paddle.concat(
+                        [init_out_bboxes_dn.unsqueeze(0), dn_out_bboxes])
+                    dn_out_masks = paddle.concat(
+                        [init_out_masks_dn.unsqueeze(0), dn_out_masks])
+            else:
+                dn_out_bboxes, dn_out_logits = None, None
+                dn_out_masks = None
+
+            enc_out_logits, enc_out_bboxes, enc_out_masks = enc_out
+            out_logits = paddle.concat(
+                [enc_out_logits.unsqueeze(0), dec_out_logits])
+            out_bboxes = paddle.concat(
+                [enc_out_bboxes.unsqueeze(0), dec_out_bboxes])
+            out_masks = paddle.concat(
+                [enc_out_masks.unsqueeze(0), dec_out_masks])
+
+            # Use decoder order logits only
+            out_order_logits = dec_out_order_logits
+
+            # Convert gt_segm to float32 for grid_sample operation
+            inputs['gt_segm'] = [gt_segm.astype(out_masks.dtype)
+                                 for gt_segm in inputs['gt_segm']]
+
+            return self.loss(
+                out_bboxes,
+                out_logits,
+                out_order_logits,
+                inputs['gt_bbox'],
+                inputs['gt_class'],
+                inputs['gt_read_order'],
+                masks=out_masks,
+                gt_mask=inputs['gt_segm'],
+                dn_out_logits=dn_out_logits,
+                dn_out_bboxes=dn_out_bboxes,
+                dn_out_masks=dn_out_masks,
+                dn_meta=dn_meta)
+        else:
+            return (dec_out_bboxes[-1], dec_out_logits[-1], dec_out_order_logits[-1], dec_out_masks[-1])
